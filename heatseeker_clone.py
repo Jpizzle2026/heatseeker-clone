@@ -1,43 +1,21 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from massive import RESTClient
 from scipy.stats import norm
 import plotly.graph_objects as go
 from datetime import datetime
+import yfinance as yf
 
-st.set_page_config(page_title="Heatseeker Clone", layout="wide")
-st.title("🔥 Heatseeker Clone by Grok")
-st.markdown("**Dealer Exposure Heatmap • Real-time GEX Nodes • Trinity Mode**  \n*Approximates Skylit AI's Heatseeker using Massive.com (ex-Polygon) data*")
+st.set_page_config(page_title="Heatseeker Clone - Free", layout="wide")
+st.title("🔥 Heatseeker Clone (Free yfinance Version)")
+st.markdown("**Dealer Exposure Heatmap • GEX Nodes • Trinity Mode**  \n*Fully free using Yahoo Finance data • Approximates Skylit AI's Heatseeker*")
 
 # Sidebar
 with st.sidebar:
     st.header("Settings")
-    # Use secrets if available, otherwise fallback to text input
-    if "POLYGON_API_KEY" in st.secrets:
-        api_key = st.secrets["POLYGON_API_KEY"]
-        st.success("✅ API key loaded from secrets")
-    else:
-        api_key = st.text_input("Massive / Polygon API Key", type="password", value="DEMO")
-    
     ticker_options = ["SPY", "QQQ"]
     selected_tickers = st.multiselect("Tickers (Trinity Mode)", ticker_options, default=ticker_options)
-    refresh_interval = st.slider("Auto-refresh (seconds)", 30, 300, 60)
-    st.info("Market hours recommended for best data")
-
-# Initialize client safely
-@st.cache_resource
-def get_client(api_key):
-    try:
-        if api_key and api_key != "DEMO":
-            return RESTClient(api_key=api_key)
-        else:
-            return RESTClient()  # demo mode if supported
-    except Exception as e:
-        st.error(f"Failed to initialize client: {e}")
-        return None
-
-client = get_client(api_key)
+    st.info("Data is delayed ~15 min. Refresh during market hours for best results.")
 
 # Black-Scholes Gamma
 def bs_gamma(S, K, T, r=0.05, sigma=None):
@@ -46,76 +24,61 @@ def bs_gamma(S, K, T, r=0.05, sigma=None):
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
-# Fetch GEX data
+# Fetch GEX data using yfinance
 @st.cache_data(ttl=60)
 def get_gex_data(ticker):
-    if not client:
-        st.error("Client not initialized. Check API key.")
-        return pd.DataFrame(), None
-    
     try:
-        options_iter = client.list_snapshot_options_chain(
-            ticker,
-            params={
-                "limit": 500,
-                "expiration_date.gte": datetime.now().strftime("%Y-%m-%d")
-            }
-        )
-        options = list(options_iter)
+        tk = yf.Ticker(ticker)
+        spot = tk.history(period="1d")['Close'].iloc[-1]
+        
+        # Get all expirations and fetch chains
+        data = []
+        for exp in tk.options[:5]:  # Limit to first 5 expirations to keep it fast
+            chain = tk.option_chain(exp)
+            calls = chain.calls
+            puts = chain.puts
+            
+            for df, opt_type in [(calls, "call"), (puts, "put")]:
+                for _, row in df.iterrows():
+                    K = row['strike']
+                    T = (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days / 365.25
+                    iv = row['impliedVolatility'] or 0.2
+                    gamma = bs_gamma(spot, K, T, sigma=iv)
+                    oi = row['openInterest'] or 0
+                    gex = gamma * oi * 100 * spot
+                    if opt_type == "put":
+                        gex = -gex
+                    
+                    data.append({
+                        "strike": K,
+                        "expiration": exp,
+                        "type": opt_type,
+                        "oi": oi,
+                        "gamma": gamma,
+                        "gex": gex,
+                        "iv": iv
+                    })
+        
+        df = pd.DataFrame(data)
+        if df.empty:
+            return pd.DataFrame(), spot
+        
+        # Aggregate per strike + expiration
+        df_agg = df.groupby(["expiration", "strike"]).agg({
+            "gex": "sum",
+            "oi": "sum",
+            "gamma": "mean",
+            "iv": "mean"
+        }).reset_index()
+        
+        df_agg["abs_gex"] = df_agg["gex"].abs()
+        df_agg["color"] = np.where(df_agg["gex"] > 0, "#FFEA00", "#6B00B6")
+        df_agg["size"] = (df_agg["abs_gex"] / df_agg["abs_gex"].max() * 60 + 10).clip(10, 80)
+        
+        return df_agg, spot
     except Exception as e:
-        st.error(f"Could not fetch data for {ticker}: {str(e)[:200]}")
+        st.error(f"Error fetching {ticker}: {e}")
         return pd.DataFrame(), None
-
-    data = []
-    spot = None
-    for opt in options:
-        try:
-            if not spot and hasattr(opt, 'underlying_asset') and opt.underlying_asset:
-                spot = opt.underlying_asset.price
-            
-            details = opt.details if hasattr(opt, 'details') else None
-            if not details:
-                continue
-                
-            K = details.strike_price
-            exp_date = datetime.strptime(details.expiration_date, "%Y-%m-%d")
-            T = (exp_date - datetime.now()).days / 365.25
-            iv = getattr(opt, 'implied_volatility', 0.2) or 0.2
-            gamma = bs_gamma(spot, K, T, sigma=iv)
-            oi = getattr(opt, 'open_interest', 0) or 0
-            gex = gamma * oi * 100 * spot
-            if details.contract_type == "put":
-                gex = -gex
-            
-            data.append({
-                "strike": K,
-                "expiration": details.expiration_date,
-                "type": details.contract_type,
-                "oi": oi,
-                "gamma": gamma,
-                "gex": gex,
-                "iv": iv
-            })
-        except:
-            continue  # skip bad entries
-    
-    df = pd.DataFrame(data)
-    if df.empty:
-        return df, spot
-    
-    # Aggregate
-    df_agg = df.groupby(["expiration", "strike"]).agg({
-        "gex": "sum",
-        "oi": "sum",
-        "gamma": "mean",
-        "iv": "mean"
-    }).reset_index()
-    
-    df_agg["abs_gex"] = df_agg["gex"].abs()
-    df_agg["color"] = np.where(df_agg["gex"] > 0, "#FFEA00", "#6B00B6")
-    df_agg["size"] = (df_agg["abs_gex"] / df_agg["abs_gex"].max() * 60 + 10).clip(10, 80)
-    
-    return df_agg, spot
 
 # Main UI
 if st.button("🔄 Refresh Data Now"):
@@ -144,12 +107,7 @@ for idx, ticker in enumerate(selected_tickers):
                 x=df["strike"],
                 y=df["gex"],
                 mode="markers",
-                marker=dict(
-                    size=df["size"],
-                    color=df["color"],
-                    line=dict(width=2, color="white"),
-                    opacity=0.85
-                ),
+                marker=dict(size=df["size"], color=df["color"], line=dict(width=2, color="white"), opacity=0.85),
                 text=df.apply(lambda row: f"Strike {row['strike']}<br>GEX: {row['gex']:.0f}<br>OI: {row['oi']}", axis=1),
                 hoverinfo="text",
                 name=f"{ticker} Nodes"
@@ -181,15 +139,13 @@ for idx, ticker in enumerate(selected_tickers):
             
             st.plotly_chart(fig, use_container_width=True)
 
-# Sidebar help
 with st.sidebar:
     st.subheader("How to Trade")
     st.markdown("""
     **Magnets** — Biggest bubbles = strongest support/resistance  
     **King Node** 👑 — Dealers heavily exposed here  
-    **Range** — Fade the edges  
-    **Refresh often** — Nodes move!
+    **Refresh often** — Nodes shift with new OI/IV
     """)
-    st.caption("Data via Massive.com • Prototype by Grok")
+    st.caption("100% Free • Powered by yfinance (Yahoo Finance) • Built by Grok")
 
-st.success("✅ Heatseeker Clone is running! Add your API key in Streamlit Secrets for best results.")
+st.success("✅ Running on free data! No API key needed.")
